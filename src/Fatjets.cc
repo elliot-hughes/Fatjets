@@ -82,12 +82,16 @@ class Fatjets : public edm::EDAnalyzer {
 		virtual void endLuminosityBlock(const edm::LuminosityBlock&, const edm::EventSetup&);
 
 	// member data
+	bool v_;
 	double R_;
 	bool make_gen_;
 	bool make_pf_;
-	bool pruning;
+	bool do_prune_;
 	vector<string> jet_strings;
 	// basic fatjet variables
+	vector<string> fat_vars;
+	map<string, vector<double>> fat_gen;
+	map<string, vector<double>> fat_pf;
 	int njets;
 	vector<double> vec_nsub1;
 	vector<double> vec_nsub2;
@@ -124,6 +128,7 @@ class Fatjets : public edm::EDAnalyzer {
 	map<string, TH2F*> h2;
 
 	// Algorithm Variables
+	map<string, JetDefinition> jet_defs;
 };
 
 //
@@ -140,26 +145,42 @@ class Fatjets : public edm::EDAnalyzer {
 // constructors and destructors
 //
 Fatjets::Fatjets(const edm::ParameterSet& iConfig) :
+	v_(iConfig.getParameter<bool>("v")),
 	R_(iConfig.getParameter<double>("R")),
 	make_gen_(iConfig.getParameter<bool>("make_gen")),
-	make_pf_(iConfig.getParameter<bool>("make_pf"))
+	make_pf_(iConfig.getParameter<bool>("make_pf")),
+	do_prune_(iConfig.getParameter<bool>("do_prune"))
 {
 //do what ever initialization is needed
+	// Jet algorithm variables
 	jet_strings.push_back("ca");
 	jet_strings.push_back("kt");
 	jet_strings.push_back("ktr");
+	jet_defs[jet_strings[0]] = JetDefinition(cambridge_algorithm, R_);
+	jet_defs[jet_strings[1]] = JetDefinition(kt_algorithm, R_);
+	jet_defs[jet_strings[2]] = JetDefinition(kt_algorithm, 0.7);
+	// Fatjet variables
+	// (When you add a new one here, make sure you fill it!)
+	fat_vars.push_back("phi");
+	fat_vars.push_back("y");
+	fat_vars.push_back("pt");
+	fat_vars.push_back("e");
+	fat_vars.push_back("m");
+	fat_vars.push_back("tau1");
+	fat_vars.push_back("tau2");
+	fat_vars.push_back("tau3");
 	// Set up output root file
 	edm::Service<TFileService> fs;
-	trees["fat"] = fs->make<TTree>("ttree_fat", "");
-	trees["fat_gen"] = fs->make<TTree>("ttree_fat_gen", "");
-	trees["ca"] = fs->make<TTree>("ttree_ca", "");
-	trees["kt"] = fs->make<TTree>("ttree_kt", "");
-	trees["ktr"] = fs->make<TTree>("ttree_ktr", "");
-	h2["eta_phi"] =  fs->make<TH2F>("eta_phi", "Geometry Of Event", 40, -5, 5, 30, -3.2, 3.2);
+	trees["fat_pf"] = fs->make<TTree>("fat_pf", "");		// This will contain branches for each pf fatjet variable.
+	trees["fat_gen"] = fs->make<TTree>("fat_gen", "");		// This will contain branches for each gen fatjet variable.
+	trees["ca"] = fs->make<TTree>("sub_ca", "");
+	trees["kt"] = fs->make<TTree>("sub_kt", "");
+	trees["ktr"] = fs->make<TTree>("sub_ktr", "");
 	h2["y_phi"] =  fs->make<TH2F>("y_phi", "Geometry Of Fatjets", 40, -5, 5, 30, 0, 6.4);
 	// Debug
+	cout << endl;
+	cout << "Starting the Fatjet analyzer..." << endl;
 	cout << "R = " << R_ << ", make_gen is " << make_gen_ << ", make_pf is " << make_pf_ << endl;
-	//Nsubjettiness
 }
 
 // DEFINE THE DESTRUCTOR
@@ -167,6 +188,10 @@ Fatjets::~Fatjets()
 {
 }
 
+// ------------ called once each job just before starting event loop  ------------
+void Fatjets::beginJob()
+{
+}
 
 // CLASS METHODS ("method" = "member function")
 
@@ -175,47 +200,42 @@ void Fatjets::analyze(
 	const edm::Event& iEvent,
 	const edm::EventSetup& iSetup
 ){
-	pruning = true;
-	map<string, JetDefinition> jet_defs;
-	jet_defs[jet_strings[0]] = JetDefinition(cambridge_algorithm, R_);
-	jet_defs[jet_strings[1]] = JetDefinition(kt_algorithm, R_);
-	jet_defs[jet_strings[2]] = JetDefinition(kt_algorithm, 0.7);
-	
-	if (make_gen_) {		// This whole section is completely experimental.  Right now, it clusters every single gen particle (like, even the starting protons...).
+	if (make_gen_) {
+		// Get gen particles from event:
 		Handle<GenParticleCollection> objects_gen;
 		iEvent.getByLabel("genParticles", objects_gen);
-	
-		cout << "The number of gen objects is " << objects_gen->size() << endl;
 		
+		if (v_) cout << "The number of gen objects is " << objects_gen->size() << endl;
+		
+		// Cluster gen particles:
 		vector<PseudoJet> jobjects_gen;
-		int n = -1;
-		for (GenParticleCollection::const_iterator gen = objects_gen->begin(); gen != objects_gen->end(); ++ gen) {
-			if (gen->status() == 1) {
-				n ++;
-				if (n < 10){
-					cout << n << ": pt = " << gen->pt() << ", y = " << gen->rapidity() << ", pdgid = " << gen->pdgId() << endl;
-				}
-				jobjects_gen.push_back( PseudoJet(gen->px(), gen->py(), gen->pz(), gen->energy()) );
+		int n_object = -1;
+		for (GenParticleCollection::const_iterator object = objects_gen->begin(); object != objects_gen->end(); ++ object) {
+			n_object ++;
+			if (object->status() == 22){		// Look at the original goddess gen particles (for fun).
+				if (v_) cout << n_object << ": m = " << object->mass() << ", phi = " << object->phi() << ", y = " << object->rapidity() << ", pdgid = " << object->pdgId() << endl;
+			}
+			if (object->status() == 1) {		// Really, only cluster gen particles that stick around.
+				jobjects_gen.push_back( PseudoJet(object->px(), object->py(), object->pz(), object->energy()) );
 			}
 		}
-		for (unsigned j = 0; j < jobjects_gen.size(); j++) {
-			h2["y_phi"]->Fill(jobjects_gen[j].rapidity(), jobjects_gen[j].phi());
+		ClusterSequence cs_gen(jobjects_gen, jet_defs[jet_strings[0]]);		// Perform the clustering with FastJet.
+		vector<PseudoJet> fatjets_gen = sorted_by_pt(cs_gen.inclusive_jets());		// Make a vector of fatjets.
+		// ADD: SORT BY M
+		
+		// ADD: FIX NSUBJETTINESS WITH DINKO'S ALGO:
+		double beta = 1.0; // power for angular dependence, e.g. beta = 1 --> linear k-means, beta = 2 --> quadratic/classic k-means
+		double R0 = 1.2; // Characteristic jet radius for normalization	      
+		double Rcut = 1.2; // maximum R particles can be from axis to be included in jet
+		Nsubjettiness nsub1(1, Njettiness::onepass_kt_axes, beta, R0, Rcut);
+		Nsubjettiness nsub2(2, Njettiness::onepass_kt_axes, beta, R0, Rcut);
+		Nsubjettiness nsub3(3, Njettiness::onepass_kt_axes, beta, R0, Rcut);
+		
+		// Save fatjet info to branches:
+		// ADD: streamline this.
+		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){		// Empty fatjet variable vectors.
+			fat_gen[*var].clear();
 		}
-		cout << "The number of gen objects with Status 1 is " << n << endl;
-		ClusterSequence cs_gen(jobjects_gen, jet_defs[jet_strings[0]]);
-		vector<PseudoJet> fatjets_gen = sorted_by_pt(cs_gen.inclusive_jets());
-		
-		
-	    double beta = 1.0; // power for angular dependence, e.g. beta = 1 --> linear k-means, beta = 2 --> quadratic/classic k-means
-	    double R0 = 1.2; // Characteristic jet radius for normalization	      
-	    double Rcut = 1.2; // maximum R particles can be from axis to be included in jet
-	    Nsubjettiness nsub1(1, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub2(2, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub3(3, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub4(4, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub5(5, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub6(6, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-		
 		vec_nsub1_gen.clear();
 		vec_nsub2_gen.clear();
 		vec_nsub3_gen.clear();
@@ -225,12 +245,8 @@ void Fatjets::analyze(
 		e_gen.clear();
 		m_gen.clear();
 		njets_gen = fatjets_gen.size();
-		int njets_gen_cut = -1;
-		for (unsigned i = 0; i < fatjets_gen.size(); i++) {
-			if (abs(fatjets_gen[i].rapidity()) < 6) {
-				njets_gen_cut ++;
-			}
-			phi_gen.push_back( fatjets_gen[i].phi_std() );		// http://fastjet.fr/repo/doxygen-3.0.2/classfastjet_1_1PseudoJet.html
+		for (unsigned i = 0; i < fatjets_gen.size(); i++) {		// Loop over fatjets.
+			phi_gen.push_back( fatjets_gen[i].phi() );		// http://fastjet.fr/repo/doxygen-3.0.2/classfastjet_1_1PseudoJet.html
 			y_gen.push_back( fatjets_gen[i].rapidity() );
 			pt_gen.push_back( fatjets_gen[i].pt() );
 			e_gen.push_back( fatjets_gen[i].e() );
@@ -239,36 +255,53 @@ void Fatjets::analyze(
 			vec_nsub2_gen.push_back( nsub2(fatjets_gen[i]) );
 			vec_nsub3_gen.push_back( nsub3(fatjets_gen[i]) );
 		}
-		cout << "-----: " << njets_gen_cut << endl;
-		cout << "-----: " << njets_gen << endl;
-		branches["njets"] = trees["fat_gen"]->Branch("njets", &njets_gen, "njets/I");
-		branches["phi"] = trees["fat_gen"]->Branch("phi", &phi_gen, 64000, 0);
-		branches["y"] = trees["fat_gen"]->Branch("y", &y_gen, 64000, 0);
-		branches["pt"] = trees["fat_gen"]->Branch("pt", &pt_gen, 64000, 0);
-		branches["e"] = trees["fat_gen"]->Branch("e", &e_gen, 64000, 0);
-		branches["m"] = trees["fat_gen"]->Branch("m", &m_gen, 64000, 0);
-		branches["nsub1"] = trees["fat_gen"]->Branch("nsub1", &vec_nsub1_gen, 64000, 0);
-		branches["nsub2"] = trees["fat_gen"]->Branch("nsub2", &vec_nsub2_gen, 64000, 0);
-		branches["nsub3"] = trees["fat_gen"]->Branch("nsub3", &vec_nsub3_gen, 64000, 0);
-		trees["fat_gen"]->Fill();
-		for (unsigned i = 0; i < 3; i++) {
-			double phi1 = fatjets_gen[i].phi();
-			double y1 = fatjets_gen[i].rapidity();
-			for (int k = 0; k < 50; k++) {
-				h2["y_phi"]->Fill(y1, phi1);
-			}
-			for (GenParticleCollection::const_iterator j = objects_gen->begin(); j != objects_gen->end(); ++ j) {
-				double phi2 = j->phi();
-				double y2 = j->rapidity();
-				if (j->mass() > 200 && j->status() == 22) {
-					double dphi = abs(phi1-phi2);
-					if (dphi > M_PI) dphi -= 2 * M_PI;
-					double dR2 = (y1-y2)*(y1-y2) + dphi*dphi;
-					cout << i << ": pt_jet = " << fatjets_gen[i].pt() << ", m_jet = " << fatjets_gen[i].m() << " phi,y " << phi1 << "," << y1 << ", m_part = " << j->mass() << ", status = " << j->status() << ", dR2 = " << dR2 << endl;
-				}
-			}
+		for (vector<PseudoJet>::iterator fatjet = fatjets_gen.begin(); fatjet != fatjets_gen.end(); ++fatjet) {		// Loop over fatjets.
+			fat_gen["phi"].push_back( fatjet->phi() );
+			fat_gen["y"].push_back( fatjet->rapidity() );
+			fat_gen["pt"].push_back( fatjet->pt() );
+			fat_gen["e"].push_back( fatjet->e() );
+			fat_gen["m"].push_back( fatjet->m() );
+			fat_gen["tau1"].push_back( nsub1(*fatjet) );
+			fat_gen["tau2"].push_back( nsub2(*fatjet) );
+			fat_gen["tau3"].push_back( nsub3(*fatjet) );
 		}
+		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){		// Make branches.
+			branches[*var] = trees["fat_gen"]->Branch(var->c_str(), &(fat_gen[*var]), 64000, 0);
+		}
+		trees["fat_gen"]->Fill();		// Save branches to the tree.
+		
+//		branches["njets"] = trees["fat_gen"]->Branch("njets", &njets_gen, "njets/I");
+//		branches["phi"] = trees["fat_gen"]->Branch("phi", &phi_gen, 64000, 0);
+//		branches["y"] = trees["fat_gen"]->Branch("y", &y_gen, 64000, 0);
+//		branches["pt"] = trees["fat_gen"]->Branch("pt", &pt_gen, 64000, 0);
+//		branches["e"] = trees["fat_gen"]->Branch("e", &e_gen, 64000, 0);
+//		branches["m"] = trees["fat_gen"]->Branch("m", &m_gen, 64000, 0);
+//		branches["nsub1"] = trees["fat_gen"]->Branch("nsub1", &vec_nsub1_gen, 64000, 0);
+//		branches["nsub2"] = trees["fat_gen"]->Branch("nsub2", &vec_nsub2_gen, 64000, 0);
+//		branches["nsub3"] = trees["fat_gen"]->Branch("nsub3", &vec_nsub3_gen, 64000, 0);
+//		trees["fat_gen"]->Fill();		// Save the branches to the tree.
+		
+//		// Gen particle exploration:
+//		for (unsigned i = 0; i < 3; i++) {
+//			double phi1 = fatjets_gen[i].phi();
+//			double y1 = fatjets_gen[i].rapidity();
+//			for (int k = 0; k < 50; k++) {
+//				h2["y_phi"]->Fill(y1, phi1);
+//			}
+//			for (GenParticleCollection::const_iterator j = objects_gen->begin(); j != objects_gen->end(); ++ j) {
+//				double phi2 = j->phi();
+//				double y2 = j->rapidity();
+//				if (j->mass() > 200 && j->status() == 22) {
+//					double dphi = abs(phi1-phi2);
+//					if (dphi > M_PI) dphi -= 2 * M_PI;
+//					double dR2 = (y1-y2)*(y1-y2) + dphi*dphi;
+//					cout << i << ": pt_jet = " << fatjets_gen[i].pt() << ", m_jet = " << fatjets_gen[i].m() << " phi,y " << phi1 << "," << y1 << ", m_part = " << j->mass() << ", status = " << j->status() << ", dR2 = " << dR2 << endl;
+//				}
+//			}
+//		}
 	}
+	
+	// REVISIONS STOP HERE...
 	if (make_pf_) {
 		Handle<PFCandidateCollection> objects_pf;
 		iEvent.getByLabel("particleFlow", objects_pf);
@@ -309,7 +342,7 @@ void Fatjets::analyze(
 		e.clear();
 		m.clear();
 		njets = fatjets_pf.size();
-		if (pruning != true) {
+		if (do_prune_ != true) {
 			// Loop over fatjets:
 			for (unsigned i = 0; i < fatjets_pf.size(); i++) {
 				phi.push_back( fatjets_pf[i].phi_std() );		// http://fastjet.fr/repo/doxygen-3.0.2/classfastjet_1_1PseudoJet.html
@@ -343,9 +376,9 @@ void Fatjets::analyze(
 			for (unsigned i = 0; i < fatjets_pf.size(); i++) {
 				vector<PseudoJet> jobjects;
 				// Recluster the fatjet, so its cluster sequence is specific to the jet in question.
-				double e_original = fatjets_pf[i].e();	//debug variable
+//				double e_original = fatjets_pf[i].e();	//debug variable
 				vector<PseudoJet> subjets;
-				if (pruning) {
+				if (do_prune_) {
 					Pruner pruner(jet_defs[jet_strings[1]], 1, 0.5);
 					PseudoJet fatjet = pruner(fatjets_pf[i]);
 					jobjects = fatjet.constituents();
@@ -436,7 +469,7 @@ void Fatjets::analyze(
 //				} 
 //				// END SUBJET ALGORITHM (The subjet indices are stored in subjet_indices and the subjets are stored in subjets.
 			}
-			if (pruning) {
+			if (do_prune_) {
 				branches["njets"] = trees["fat"]->Branch("njets", &njets, "njets/I");
 				branches["phi"] = trees["fat"]->Branch("phi", &phi, 64000, 0);
 				branches["y"] = trees["fat"]->Branch("y", &y, 64000, 0);
@@ -459,12 +492,6 @@ void Fatjets::analyze(
 			trees[jet_string]->Fill();
 		}
 	}
-}
-
-
-// ------------ called once each job just before starting event loop  ------------
-void Fatjets::beginJob()
-{
 }
 
 // ------------  called once each job just after ending the event loop  ------------

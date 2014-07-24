@@ -50,9 +50,11 @@ process.GlobalTag.globaltag = cms.string(autoCond['startup'])		# Set global tags
 ##process.caSubjetFilterGenJets.rParam = cms.double(0.5)
 
 process.analyzer = cms.EDAnalyzer('Fatjets',
+	v = cms.bool(False),		# verbose mode
 	R = cms.double(0.7),
 	make_gen = cms.bool(True),
-	make_pf = cms.bool(True)
+	make_pf = cms.bool(True),
+	do_prune = cms.bool(False)
 )
 
 ## ------------------------------------------------------
@@ -81,20 +83,23 @@ process.p = cms.Path(
 ## ------------------------------------------------------
 
 # PARAMETERS
-mgo = 850
+msg = 850
 msq = 250
-process.analyzer.R = 1.2
+R = 1.4
+process.analyzer.v = True
+process.analyzer.R = R
 process.analyzer.make_gen = True
 process.analyzer.make_pf = False
+process.analyzer.do_prune = False
 # INPUT FILES
 process.source.fileNames = cms.untracked.vstring(
-	'file:/cms/tote/jet/reco/mgo{0}_msq{1}.root'.format(mgo, msq),
+	'file:/cms/tote/jet/reco/mgo{0}_msq{1}.root'.format(msg, msq),
 )
 # OUTPUT FILES
 process.out.fileName = 'test/fatjets_test.root'
-process.TFileService.fileName = 'test/ntuple_fatjet.root'
+process.TFileService.fileName = 'test/fatjets_sgtosq_msg{0}_msq{1}_R{2}.root'.format(msg, msq, int(R*10))
 # NUMBER OF EVENTS
-process.maxEvents.input = 1
+process.maxEvents.input = 1000
 # REPORTS
 process.options.wantSummary = cms.untracked.bool(False)		# Turn off the long job summary.
 
