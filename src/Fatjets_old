@@ -1,0 +1,197 @@
+/* C++
+Path: Analyzers/Fatjets/src/Fatjets.cc
+Package: Fatjets
+Class: Fatjets
+
+Author: Elliot Hughes
+Last Updated: 140715
+Purpose: To ntuplize fatjets.
+*/
+
+// INCLUDES
+// system include files
+#include <iostream>
+#include <memory>
+#include <map>
+#include <string>
+#include <typeinfo>
+
+using std::map;
+using std::string;
+using std::cout;
+using std::endl;
+
+// user include files
+	// basic includes
+#include "FWCore/Framework/interface/Frameworkfwd.h"
+#include "FWCore/Framework/interface/EDAnalyzer.h"
+#include "FWCore/Framework/interface/Event.h"
+#include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/ParameterSet/interface/ParameterSet.h"
+
+#include "DataFormats/Common/interface/Handle.h"
+#include "FWCore/Framework/interface/ESHandle.h"
+#include "fastjet/PseudoJet.hh"
+
+	// class includes
+//#include "SimDataFormats/CaloHit/interface/PCaloHit.h"
+//#include "SimDataFormats/CaloHit/interface/PCaloHitContainer.h"
+//#include "DataFormats/HcalRecHit/interface/HBHERecHit.h"
+//#include "DataFormats/HcalRecHit/interface/HcalRecHitCollections.h"
+//#include "DataFormats/HcalDetId/interface/HcalDetId.h"
+//#include "DataFormats/HcalDetId/interface/HcalSubdetector.h"
+//#include "SimDataFormats/CrossingFrame/interface/MixCollection.h"		// For looking at pilup
+//#include "SimDataFormats/CrossingFrame/interface/CrossingFramePlaybackInfoExtended.h"
+#include "DataFormats/JetReco/interface/BasicJet.h"
+#include "DataFormats/JetReco/interface/BasicJetCollection.h"
+
+//#include "Geometry/CaloGeometry/interface/CaloGeometry.h"
+//#include "Geometry/Records/interface/CaloGeometryRecord.h"
+//#include "Geometry/CaloGeometry/interface/CaloSubdetectorGeometry.h"
+
+#include "FWCore/MessageLogger/interface/MessageLogger.h"
+#include "FWCore/ServiceRegistry/interface/Service.h"
+#include "CommonTools/UtilAlgos/interface/TFileService.h"
+
+	// ROOT includes
+#include "TH1.h"
+#include "TH2.h"
+#include "TFile.h"
+//#include "TFileDirectory.h"
+#include "TTree.h"
+#include "TNtuple.h"
+// \INCLUDES
+
+// CLASS DEFINITION
+class Fatjets : public edm::EDAnalyzer {
+	public:
+		explicit Fatjets(const edm::ParameterSet&);	// Set the class argument to be (a reference to) a parameter set (?)
+		~Fatjets();	// Create the destructor.
+		static void fillDescriptions(edm::ConfigurationDescriptions& descriptions);
+
+	private:
+		virtual void beginJob();
+		virtual void analyze(const edm::Event&, const edm::EventSetup&);
+		virtual void endJob();
+		virtual void beginRun(const edm::Run&, const edm::EventSetup&);
+		virtual void endRun(const edm::Run&, const edm::EventSetup&);
+		virtual void beginLuminosityBlock(const edm::LuminosityBlock&, const edm::EventSetup&);
+		virtual void endLuminosityBlock(const edm::LuminosityBlock&, const edm::EventSetup&);
+
+	// member data
+	unsigned int test_;
+//	std::vector<double> sf_hb_;
+	
+	// CONSTRUCT ROOT OBJECT CONTAINERS
+	TNtuple* ntuple_fat;
+	map<string, TH1F*> h1;
+	map<string, TH2F*> h2;
+};
+
+//
+// constants, enums and typedefs
+//
+	// DEFINE CUTS
+//	float cut_er = 5;
+
+//
+// static data member definitions
+//
+
+
+// constructors and destructors
+//
+Fatjets::Fatjets(const edm::ParameterSet& iConfig) :
+	test_(iConfig.getUntrackedParameter<unsigned int>("test",0))//,
+//	sf_hb_(iConfig.getParameter<std::vector<double>>("sf_hb")),
+//	sf_he_(iConfig.getParameter<std::vector<double>>("sf_he"))
+{
+//do what ever initialization is needed
+	// Set up output root file
+	edm::Service<TFileService> fs;
+	// Set up ntpules
+	ntuple_fat = fs->make<TNtuple>("ntuple_fat", "NTuple for fatjets", "eta:phi:pt");
+}
+
+// DEFINE THE DESTRUCTOR
+Fatjets::~Fatjets()
+{
+}
+
+
+// CLASS METHODS ("method" = "member function")
+
+// ------------ called for each event  ------------
+void Fatjets::analyze(
+	const edm::Event& iEvent,
+	const edm::EventSetup& iSetup
+){
+	using namespace reco;
+	using namespace edm;
+	
+	Handle<BasicJetCollection> fatjets;
+	iEvent.getByLabel("caSubjetFilterGenJets", "fat", fatjets);
+	
+	cout << "The number of fatjets is " << fatjets->size() << endl;
+	
+	int n = -1;
+	// LOOP OVER FATJETS
+	for (BasicJetCollection::const_iterator fatjet = fatjets->begin(); fatjet != fatjets->end(); ++ fatjet) {
+		n ++;
+		
+		float pt = fatjet->pt();
+		float eta = fatjet->eta();
+		float phi = fatjet->phi();
+		if (n < 10) {
+			cout << n << ": " << eta << " " << phi << " " << pt << endl;
+		}
+	}
+}
+
+
+// ------------ called once each job just before starting event loop  ------------
+void Fatjets::beginJob()
+{
+}
+
+// ------------  called once each job just after ending the event loop  ------------
+void Fatjets::endJob()
+{
+}
+
+// ------------ method called when starting to processes a run  ------------
+void 
+Fatjets::beginRun(edm::Run const&, edm::EventSetup const&)
+{
+}
+
+// ------------ method called when ending the processing of a run  ------------
+void 
+Fatjets::endRun(edm::Run const&, edm::EventSetup const&)
+{
+}
+
+// ------------ method called when starting to processes a luminosity block  ------------
+void 
+Fatjets::beginLuminosityBlock(edm::LuminosityBlock const&, edm::EventSetup const&)
+{
+}
+
+// ------------ method called when ending the processing of a luminosity block  ------------
+void 
+Fatjets::endLuminosityBlock(edm::LuminosityBlock const&, edm::EventSetup const&)
+{
+}
+
+// ------------ method fills 'descriptions' with the allowed parameters for the module  ------------
+void
+Fatjets::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
+  //The following says we do not know what parameters are allowed so do no validation
+  // Please change this to state exactly what you do use, even if it is no parameters
+  edm::ParameterSetDescription desc;
+  desc.setUnknown();
+  descriptions.addDefault(desc);
+}
+
+//define this as a plug-in
+DEFINE_FWK_MODULE(Fatjets);
