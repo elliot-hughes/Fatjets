@@ -54,6 +54,7 @@ process.analyzer = cms.EDAnalyzer('Fatjets',
 	R = cms.double(0.7),
 	make_gen = cms.bool(True),
 	make_pf = cms.bool(True),
+	do_true = cms.bool(False),
 	do_prune = cms.bool(False)
 )
 
@@ -86,10 +87,12 @@ process.p = cms.Path(
 msg = 850
 msq = 250
 R = 1.4
-process.analyzer.v = True
+#process.analyzer.v = True
+process.analyzer.v = False
 process.analyzer.R = R
 process.analyzer.make_gen = True
 process.analyzer.make_pf = False
+process.analyzer.do_true = True
 process.analyzer.do_prune = False
 # INPUT FILES
 process.source.fileNames = cms.untracked.vstring(
@@ -97,7 +100,13 @@ process.source.fileNames = cms.untracked.vstring(
 )
 # OUTPUT FILES
 process.out.fileName = 'test/fatjets_test.root'
-process.TFileService.fileName = 'test/fatjets_sgtosq_msg{0}_msq{1}_R{2}.root'.format(msg, msq, int(R*10))
+output_string = ""
+if (process.analyzer.do_true == True):
+	output_string += "_true"
+if (process.analyzer.do_prune == True):
+	output_string += "_pruned"
+process.TFileService.fileName = 'test/test.root'
+#process.TFileService.fileName = 'test/fatjets_sgtosq_msg{0}_msq{1}_R{2}{3}.root'.format(msg, msq, int(R*10), output_string)
 # NUMBER OF EVENTS
 process.maxEvents.input = 1000
 # REPORTS
