@@ -16,7 +16,8 @@ process.options = cms.untracked.PSet(
 )
 # Input
 process.source = cms.Source("PoolSource",
-	fileNames = cms.untracked.vstring()
+	fileNames = cms.untracked.vstring(),
+#	eventsToProcess = cms.untracked.VEventRange('1:44929-1:44938'),
 )
 # Output
 from PhysicsTools.PatAlgos.patEventContent_cff import patEventContent
@@ -55,7 +56,10 @@ process.analyzer = cms.EDAnalyzer('Fatjets',
 	make_gen = cms.bool(True),
 	make_pf = cms.bool(True),
 	do_true = cms.bool(False),
-	do_prune = cms.bool(False)
+	do_prune = cms.bool(False),
+	do_trim = cms.bool(False),
+	trim_R = cms.double(0.3),
+	trim_ptf = cms.double(0.2)
 )
 
 ## ------------------------------------------------------
@@ -86,14 +90,19 @@ process.p = cms.Path(
 # PARAMETERS
 msg = 850
 msq = 250
-R = 1.4
+R = 1.2
+trim_R = 1.0
+trim_ptf = 0.1
 #process.analyzer.v = True
 process.analyzer.v = False
 process.analyzer.R = R
 process.analyzer.make_gen = True
-process.analyzer.make_pf = False
-process.analyzer.do_true = True
+process.analyzer.make_pf = True
+process.analyzer.do_true = False
 process.analyzer.do_prune = False
+process.analyzer.do_trim = False
+process.analyzer.trim_R = trim_R
+process.analyzer.trim_ptf = trim_ptf
 # INPUT FILES
 process.source.fileNames = cms.untracked.vstring(
 	'file:/cms/tote/jet/reco/mgo{0}_msq{1}.root'.format(msg, msq),
@@ -105,10 +114,12 @@ if (process.analyzer.do_true == True):
 	output_string += "_true"
 if (process.analyzer.do_prune == True):
 	output_string += "_pruned"
-process.TFileService.fileName = 'test/test.root'
-#process.TFileService.fileName = 'test/fatjets_sgtosq_msg{0}_msq{1}_R{2}{3}.root'.format(msg, msq, int(R*10), output_string)
+if (process.analyzer.do_trim == True):
+	output_string += "_trimmed_{0}_{1}".format(int(trim_R*10), int(trim_ptf*10))
+#process.TFileService.fileName = 'test/test.root'
+process.TFileService.fileName = 'test/fatjets_sgtosq_msg{0}_msq{1}_R{2}{3}.root'.format(msg, msq, int(R*10), output_string)
 # NUMBER OF EVENTS
-process.maxEvents.input = 1000
+process.maxEvents.input = 10000
 # REPORTS
 process.options.wantSummary = cms.untracked.bool(False)		# Turn off the long job summary.
 

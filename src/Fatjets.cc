@@ -23,7 +23,7 @@ I will store everything in an ntuple and use a python script to make plots later
 #include <typeinfo>
 
 // user include files
-	// basic includes
+//// basic includes
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/Framework/interface/EDAnalyzer.h"
 #include "FWCore/Framework/interface/Event.h"
@@ -33,7 +33,7 @@ I will store everything in an ntuple and use a python script to make plots later
 #include "DataFormats/Common/interface/Handle.h"
 #include "FWCore/Framework/interface/ESHandle.h"
 
-	// class includes
+//// important class includes
 #include "DataFormats/Math/interface/deltaR.h"
 #include "DataFormats/Math/interface/deltaPhi.h"
 #include "DataFormats/JetReco/interface/BasicJet.h"
@@ -44,6 +44,8 @@ I will store everything in an ntuple and use a python script to make plots later
 #include "fastjet/ClusterSequence.hh"		// JetDefinition, ClusterSequence, etc.
 #include "fastjet-contrib/Nsubjettiness/Nsubjettiness.hh"
 #include "fastjet/tools/Pruner.hh"
+#include "fastjet/Selector.hh"
+#include "fastjet/tools/Filter.hh"
 
 
 #include "FWCore/MessageLogger/interface/MessageLogger.h"
@@ -95,16 +97,17 @@ class Fatjets : public edm::EDAnalyzer {
 		virtual void endLuminosityBlock(const edm::LuminosityBlock&, const edm::EventSetup&);
 
 	// member data
-	bool v_;
-	double R_;
-	bool make_gen_;
-	bool make_pf_;
-	bool do_true_;
-	bool do_prune_;
+	// These variables are filled by setting the python configuration file:
+	bool v_;		// Verbose control
+	double R_;		// Fatjet distance parameter
+	bool make_gen_, make_pf_;		// Controls to make gen fatjets or pf fatjets
+	bool do_true_;		// Control to look only at squark products (DOESN'T WORK)
+	bool do_prune_, do_trim_;		// Controls for fatjet transformers
+	double trim_R_, trim_ptf_;		// Trimmer transformer parameters
 	vector<string> jet_strings;
 	// basic fatjet variables
 	vector<string> fat_vars;
-	map<string, vector<double>> fat_gen;
+	map<string, vector<double>> fat_gen;		// This is a container for the branches I eventually save as gen output.
 	map<string, vector<double>> fat_pf;
 	int njets;
 	vector<double> vec_nsub1;
@@ -142,8 +145,9 @@ class Fatjets : public edm::EDAnalyzer {
 	map<string, TH2F*> h2;
 
 	// Algorithm Variables
-	int n_event, counter, n_error_g, n_error_m;
+	int n_event, counter, n_error_g, n_error_sq, n_error_m, n_error_sort;
 	map<string, JetDefinition> jet_defs;
+	vector<int> outliers;
 };
 
 //
@@ -165,13 +169,18 @@ Fatjets::Fatjets(const edm::ParameterSet& iConfig) :
 	make_gen_(iConfig.getParameter<bool>("make_gen")),
 	make_pf_(iConfig.getParameter<bool>("make_pf")),
 	do_true_(iConfig.getParameter<bool>("do_true")),
-	do_prune_(iConfig.getParameter<bool>("do_prune"))
+	do_prune_(iConfig.getParameter<bool>("do_prune")),
+	do_trim_(iConfig.getParameter<bool>("do_trim")),
+	trim_R_(iConfig.getParameter<double>("trim_R")),
+	trim_ptf_(iConfig.getParameter<double>("trim_ptf"))
 {
 //do what ever initialization is needed
 	// Simple algorithm variables
 	n_event = 0;
 	n_error_g = 0;
+	n_error_sq = 0;
 	n_error_m = 0;
+	n_error_sort = 0;
 	counter = 0;
 	// Jet algorithm variables
 	jet_strings.push_back("ca");
@@ -190,6 +199,8 @@ Fatjets::Fatjets(const edm::ParameterSet& iConfig) :
 	fat_vars.push_back("tau1");
 	fat_vars.push_back("tau2");
 	fat_vars.push_back("tau3");
+	fat_vars.push_back("dr_fj");
+	fat_vars.push_back("dr_sq");
 	// Set up output root file
 	edm::Service<TFileService> fs;
 	trees["fat_pf"] = fs->make<TTree>("fat_pf", "");		// This will contain branches for each pf fatjet variable.
@@ -223,38 +234,59 @@ void Fatjets::analyze(
 	const edm::EventSetup& iSetup
 ){
 	n_event ++;
-	// Fatjet transformers
+	// Declare fatjet transformers:
 	Pruner pruner(jet_defs[jet_strings[1]], 0.3, 1.0);		// jobject is discarded if both are true: zcut: pt1 or pt2 < zcut*pt(1+2), Rcut_factor: dR12 > Rcut_factor*2m/pt (m, pt are the fatjet's).
+	Filter trimmer(trim_R_, SelectorPtFractionMin(trim_ptf_));		// Recluster FJ using CA with R = trim_R_, then discard any subjets that have pt less than trim_ptf_*pt_fatjet.
 	if (make_gen_) {
+		// Declare some gen-specific variables:
+		vector<Candidate*> goddesses;		// This is a confused idea that I need to rethink.
+		vector<GenParticle*> squarks;		// Containers for the initial squarks
+		double dR_sq;		// Distance between the two initial squarks
+		
 		// Get gen particles from event:
 		Handle<GenParticleCollection> objects_gen;
 		iEvent.getByLabel("genParticles", objects_gen);
 		
-		vector<Candidate*> goddesses;
-		
-		if (v_) cout << "The number of gen objects is " << objects_gen->size() << endl;
+		if (v_) cout << ">> Starting to make gen fatjets:" << endl;
+		if (v_) cout << ">> The number of gen objects in the event is " << objects_gen->size() << "." << endl;
 		
 		// Cluster gen particles:
-		vector<PseudoJet> jobjects_gen;
-		vector<PseudoJet> jobjects_gen_true;
-		int n_object = -1;
-		int n_object_1 = -1;
-		for (GenParticleCollection::const_iterator object = objects_gen->begin(); object != objects_gen->end(); ++ object) {		// Loop over gen objects.
+		vector<PseudoJet> jobjects_gen;		// Container for gen particles that will be clustered into a fatjet
+		vector<PseudoJet> jobjects_gen_true;		// Container for specialized gen particles, if a more exotic selection is needed.
+		int n_object = -1;		// Counter for gen particles
+		int n_object_1 = -1;		// Counter for gen particles with Status 1 (stable)
+		//// Loop over gen particles:
+		for (GenParticleCollection::const_iterator object = objects_gen->begin(); object != objects_gen->end(); ++ object) {
 			n_object ++;
-//			cout << n_object << endl;
-			int status = object->status();
-			int pdgid = object->pdgId();
-			double mass = object->mass(), pt = object->pt(), y = object->rapidity(), phi = object->phi();
+//			cout << "n_gen_particle = " << n_object << endl;
+			int status = object->status();		// Get the gen particle status.
+			int pdgid = object->pdgId();		// Get the gen particle PDG ID.
+			int n_mothers = object->numberOfMothers();		// Get the number of mothers the gen particle has.
+			double mass = object->mass(), pt = object->pt(), y = object->rapidity(), phi = object->phi();		// Get kinematic variables.
 			bool is_goddess = false;
 			Candidate* goddess;
 			
+			//// Get the squarks:
+			if (status == 22 && abs(pdgid) == 1000005) {
+				squarks.push_back(object->clone());		// Remember, clone makes a copy of the object and returns a pointer to it.
+			}
+			
+			//// Play around with gen particles:
+//			if (status == 22 || status == 23 || status == 4) {
+//				if (n_mothers > 0) {
+//					cout << pdgid << "   " << status << "   " << y << "   " << phi << "   " << n_mothers << "   " << object->mother()->pdgId() << endl;
+//				}
+//				else {
+//					cout << pdgid << "   " << status << "   " << y << "   " << phi << "   " << n_mothers << endl;
+//				}
+//			}
 			// Find object's goddess (supreme mother):
 //			GenParticle object_temp = *object;
 //			const Candidate* goddess_temp = (object->mother()) ? object->mother() : &object_temp;
 //			map<int, Candidate> lineage;
 			vector<int> lineage;
 			lineage.push_back(status);
-			if (object->mother()){
+			if (object->mother() && object->numberOfMothers() < 2){		// THIS IS A PROBLEM (it only looks one step back...)
 				if (object->numberOfMothers() > 1) {
 					n_error_m ++;
 				}
@@ -284,12 +316,14 @@ void Fatjets::analyze(
 					goddesses.push_back(goddess);
 				}
 			}
-			if (status == 1) {		// Really, only cluster gen particles that stick around.
+			
+			//// Fill jobjects with the particles that stick around:
+			if (status == 1) {
 				n_object_1 ++;
 				jobjects_gen.push_back( PseudoJet(object->px(), object->py(), object->pz(), object->energy()) );
-////				if (goddess->status() != 4) {		// I make a collection of objects that only came from the squarks.
-////					jobjects_gen_true.push_back( PseudoJet(object->px(), object->py(), object->pz(), object->energy()) );
-////				}
+//				if (goddess->pdgId() == 1000005 && n_mothers < 2) {		// I make a collection of objects that only came from the squarks. (DOESN'T WORK)
+//					jobjects_gen_true.push_back( PseudoJet(object->px(), object->py(), object->pz(), object->energy()) );
+//				}
 //				double dR = sqrt( pow(goddess->rapidity()-object->rapidity(), 2) + pow(deltaPhi(*goddess, *object), 2) );
 //				h1["dR"]->Fill(dR);
 				
@@ -301,25 +335,64 @@ void Fatjets::analyze(
 //					}
 //					cout << endl;
 //				}
-				
 			}
-			if (object->pdgId() > 1000021) {
+//			if (object->pdgId() > 1000021) {
 //				cout << n_object << ": m = " << object->mass() << ", phi = " << object->phi() << ", y = " << object->rapidity() << ", pdgid = " << object->pdgId() << ", status = " << object->status() << ", goddess = " << goddess->pdgId() << "  " << goddess->status() << endl;
-			}
-		}
-		cout << goddesses.size() << endl;
-		if (goddesses.size() != 4) {
-			n_error_g ++;
-		}
-//		for (auto g : goddesses) {
-//			cout << g->pdgId() << "  " << g->rapidity() << "  " << g->phi() << endl;
+//			}
+		}		// End of gen particle loop.
+//		cout << goddesses.size() << endl;
+//		if (goddesses.size() != 4) {
+//			n_error_g ++;
 //		}
-		ClusterSequence cs_gen = (do_true_) ? ClusterSequence(jobjects_gen_true, jet_defs[jet_strings[0]]) : ClusterSequence(jobjects_gen, jet_defs[jet_strings[0]]);		// Perform the clustering with FastJet.
-		vector<PseudoJet> fatjets_unsorted = cs_gen.inclusive_jets();
-//		vector<PseudoJet> fatjets_unsorted = sorted_by_pt(cs_gen.inclusive_jets());
-		vector<PseudoJet> fatjets_gen = fatjets_unsorted;
+		// Do we only see 2 squarks in the event (as we expected to)?
+		if (squarks.size() != 2) {
+			n_error_sq ++;
+			cout << "Error: " << squarks.size() << " were found!" << endl;
+		}
+		else {
+			// Calculate dR between the squarks:
+			double y0 = squarks[0]->rapidity();
+			double y1 = squarks[1]->rapidity();
+			double phi0 = squarks[0]->phi();
+			double phi1 = squarks[1]->phi();
+			dR_sq = sqrt( pow( (y0 - y1), 2 ) + pow( deltaPhi(phi0, phi1), 2 ) );
+//			cout << dR_sq << endl;
+		}
 		
-		sort(fatjets_gen.begin(), fatjets_gen.end(), sort_by_m());
+		// More stuff I need to fix up.
+		int first_squark = 0;
+//		Candidate* first_squark;
+//		if (n_event == 404) {
+		bool found = false;
+		int n_goddess = -1;
+		for (auto g : goddesses) {
+			n_goddess ++;
+			if (g->pdgId() == 1000005 && found == false) {
+				first_squark = n_goddess;
+//				first_squark = goddesses[n_goddess];
+				found = true;
+//				cout << "HERE" << endl;
+//				cout << first_squark << endl;
+////				cout << first_squark->pdgId() << endl;
+			}
+//			cout << g->pdgId() << endl; // "  " << g->rapidity() << "  " << g->phi() << endl;
+		}
+//		if (found == true) {
+//			cout << first_squark << endl;
+//			cout << goddesses[first_squark]->pdgId() << endl; // << "  " << goddessfirst_squark->rapidity() << "  " << first_squark->phi() << endl;
+//		}
+//		else {
+//			cout << "Could not find first squark." << endl;
+//		}
+		
+		// Make the fatjets!:
+		ClusterSequence cs_gen = (do_true_) ? ClusterSequence(jobjects_gen_true, jet_defs[jet_strings[0]]) : ClusterSequence(jobjects_gen, jet_defs[jet_strings[0]]);		// Perform the clustering with FastJet.
+		vector<PseudoJet> fatjets_gen = cs_gen.inclusive_jets();
+//		vector<PseudoJet> fatjets_unsorted = sorted_by_pt(cs_gen.inclusive_jets());
+//		vector<PseudoJet> fatjets_gen = fatjets_unsorted;
+		sort(fatjets_gen.begin(), fatjets_gen.end(), sort_by_m());		// Sort fatjets by invariant mass.
+		
+		if (v_) cout << ">> Number of gen fatjets: " << fatjets_gen.size() << endl;
 		
 //		vector<double> m(fatjets_unsorted.size());
 //		for (size_t i = 0; i < fatjets_unsorted.size(); i++) {m[i] = fatjets_unsorted[i].m();}
@@ -339,17 +412,12 @@ void Fatjets::analyze(
 //		}
 
 		// Check fatjet sorting (delete eventually):
-//		int cntr = 0;
-//		if (fatjets_gen.size() > 1){
+		if (fatjets_gen.size() > 1){
 //			cout << "HERE 275 " << fatjets_gen[0].m() << "  " << fatjets_gen[1].m() << "  " << fatjets_gen[2].m() << "  " << fatjets_gen[3].m() << "  " << fatjets_gen[4].m() << "   " << fatjets_gen.size() << endl;
-//			if (fatjets_gen[0].m() < fatjets_gen[1].m() || fatjets_gen[0].m() < fatjets_gen[2].m()) {
-//				cntr ++;
-//			}
-//		}
-//		if (cntr > 0) {
-//			cout << cntr << endl;
-//			counter ++;
-//		}
+			if (fatjets_gen[0].m() < fatjets_gen[1].m() || fatjets_gen[0].m() < fatjets_gen[2].m()) {
+				n_error_sort ++;
+			}
+		}
 
 		// ADD: FIX NSUBJETTINESS WITH DINKO'S ALGO:
 		double beta = 1.0; // power for angular dependence, e.g. beta = 1 --> linear k-means, beta = 2 --> quadratic/classic k-means
@@ -359,17 +427,60 @@ void Fatjets::analyze(
 		Nsubjettiness nsub2(2, Njettiness::onepass_kt_axes, beta, R0, Rcut);
 		Nsubjettiness nsub3(3, Njettiness::onepass_kt_axes, beta, R0, Rcut);
 		
-		// Save fatjet info to branches:
-		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){		// Empty fatjet variable vectors.
+		// Clear fatjet variable containers:
+		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){
 			fat_gen[*var].clear();
 		}
-		for (vector<PseudoJet>::iterator fatjet = fatjets_gen.begin(); fatjet != fatjets_gen.end(); ++fatjet) {		// Loop over fatjets.
-			PseudoJet fatjet_temp = (do_prune_) ? pruner(*fatjet) : *fatjet;		// Apply pruning if need be.
+		
+		// Loop over fatjets:
+		int n_fj = -1;
+		for (vector<PseudoJet>::iterator fj = fatjets_gen.begin(); fj != fatjets_gen.end(); ++fj) {
+			n_fj ++;
 			
-//			if (fatjet_temp.m() > 600) {
-//				vector<PseudoJet> pieces = fatjet_temp.constituents();
+			// Declare variables specific to fatjet loop:
+			vector<double> dR_fj_sq;		// Distances between fajet and squarks
+			double dR_min = 100;
+			int sq_close = -1;
+		
+			// Apply transformers:
+			PseudoJet fatjet;
+			if (do_prune_) {		// Apply pruning if need be.
+				fatjet = pruner(*fj);
+			}
+			else if (do_trim_){
+				fatjet = trimmer(*fj);
+			}
+			else {
+				fatjet = *fj;
+			}
+			
+			if (n_fj < 2){
+				if (v_) cout << ">> FJ " << n_fj << ": m = " << fatjet.m() << " GeV" << endl;
+			}
+			
+			// Find squark closest to fatjet:
+			//// Loop over squarks:
+			for (unsigned sq = 0; sq < squarks.size(); sq ++) {
+				double phi_sq = squarks[sq]->phi();
+				double dR_temp = sqrt( pow(squarks[sq]->rapidity()-fatjet.rapidity(), 2) + pow(deltaPhi(phi_sq, fatjet.phi()), 2) );
+				dR_fj_sq.push_back(dR_temp);
+				if (dR_temp < dR_min) {
+					dR_min = dR_temp;
+					sq_close = sq;
+				}
+			}
+//			cout << "The closest squark is Squark " << sq_close << " with dR = " << dR_min << ",   ";
+//			for (auto r : dR_fj_sq) {
+//				cout << r << "  ";
+//			}
+//			cout << endl;
+			
+			// Old stuff:
+//			if (fatjet.m() > 600) {
+//				outliers.push_back(n_event);
+//				vector<PseudoJet> pieces = fatjet.constituents();
 //				sort(pieces.begin(), pieces.end(), sort_by_m());
-//				cout << "Big fatjet: m = " << fatjet_temp.m() << ", n_constituents = " << pieces.size() << endl;
+//				cout << "Big fatjet: m = " << fatjet.m() << ", n_constituents = " << pieces.size() << endl;
 //				int n_piece = -1;
 //				for (vector<PseudoJet>::iterator piece = pieces.begin(); piece != pieces.end(); ++ piece) {
 //					n_piece ++;
@@ -380,16 +491,20 @@ void Fatjets::analyze(
 //			}
 			
 			// Fill the vectors that I want to store as branches.
-			fat_gen["phi"].push_back( fatjet_temp.phi() );
-			fat_gen["y"].push_back( fatjet_temp.rapidity() );
-			fat_gen["pt"].push_back( fatjet_temp.pt() );
-			fat_gen["e"].push_back( fatjet_temp.e() );
-			fat_gen["m"].push_back( fatjet_temp.m() );
-			fat_gen["tau1"].push_back( nsub1(fatjet_temp) );
-			fat_gen["tau2"].push_back( nsub2(fatjet_temp) );
-			fat_gen["tau3"].push_back( nsub3(fatjet_temp) );
+			fat_gen["phi"].push_back( fatjet.phi() );
+			fat_gen["y"].push_back( fatjet.rapidity() );
+			fat_gen["pt"].push_back( fatjet.pt() );
+			fat_gen["e"].push_back( fatjet.e() );
+			fat_gen["m"].push_back( fatjet.m() );
+			fat_gen["tau1"].push_back( nsub1(fatjet) );
+			fat_gen["tau2"].push_back( nsub2(fatjet) );
+			fat_gen["tau3"].push_back( nsub3(fatjet) );
+			fat_gen["dr_fj"].push_back( dR_min );
 		}
-		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){		// Make branches from the vectors.
+		fat_gen["dr_sq"].push_back( dR_sq );
+		
+		// Make branches from the fatjet variable vectors:
+		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){
 			branches[*var] = trees["fat_gen"]->Branch(var->c_str(), &(fat_gen[*var]), 64000, 0);
 		}
 		trees["fat_gen"]->Fill();		// Save branches to the tree.
@@ -416,145 +531,176 @@ void Fatjets::analyze(
 	
 	// REVISIONS STOP HERE...
 	if (make_pf_) {
+		
+		// Get PF objects from the event:
 		Handle<PFCandidateCollection> objects_pf;
 		iEvent.getByLabel("particleFlow", objects_pf);
 	
-		cout << "The number of PF objects is " << objects_pf->size() << endl;
+		if (v_) cout << ">> Starting to make PF fatjets:" << endl;
+		if (v_) cout << ">> The number of PF objects is " << objects_pf->size() << "." << endl;
 		
-		vector<PseudoJet> jobjects_pf;
-		int n = -1;
-		for (PFCandidateCollection::const_iterator pf = objects_pf->begin(); pf != objects_pf->end(); ++ pf) {
-			n ++;
-			if (n < 5){
-				cout << n << ": px = " << pf->px() << ", py = " << pf->py() << ", pz = " << pf->pz() << ", E = " << pf->energy() << ": pdgId = " << pf->pdgId() << endl;
-			}
-			h2["eta_phi"]->Fill(pf->eta(), pf->phi());
-			jobjects_pf.push_back( PseudoJet(pf->px(), pf->py(), pf->pz(), pf->energy()) );
+		// Cluster PF objects:
+		vector<PseudoJet> jobjects_pf;		// Container for PF particles that will be clustered into a fatjet
+		int n_object = -1;		// Counter for PF objects
+		//// Loop over PF objects:
+		for (PFCandidateCollection::const_iterator object = objects_pf->begin(); object != objects_pf->end(); ++ object) {
+			n_object ++;
+			
+			// ADD: define some variables to store object values like pt
+			
+//			if (n_object < 5){
+//				cout << "PF object Number " << n_object << ": px = " << object->px() << ", py = " << object->py() << ", pz = " << object->pz() << ", E = " << object->energy() << ": pdgId = " << object->pdgId() << endl;
+//			}
+//			h2["eta_phi"]->Fill(object->eta(), object->phi());
+			
+			jobjects_pf.push_back( PseudoJet(object->px(), object->py(), object->pz(), object->energy()) );
 		}
-		JetDefinition thing(cambridge_algorithm, R_);
-		ClusterSequence cs(jobjects_pf, thing);
-		cout << "The number of objects to be used in clustering is " << cs.n_particles() << endl;
-		vector<PseudoJet> fatjets_pf = sorted_by_pt(cs.inclusive_jets());
+		//// Cluster:
+		ClusterSequence cs_pf(jobjects_pf, jet_defs[jet_strings[0]]);		// Perform the clustering with FastJet.
+		vector<PseudoJet> fatjets_pf = cs_pf.inclusive_jets();
+		sort(fatjets_pf.begin(), fatjets_pf.end(), sort_by_m());		// Sort fatjets by invariant mass.
+		
+		if (v_) cout << ">> Number of PF fatjets: " << fatjets_pf.size() << endl;
+		
+		
+		// Check fatjet sorting (delete eventually):
+		if (fatjets_pf.size() >= 1){
+			if (fatjets_pf[0].m() < fatjets_pf[1].m()) {
+				cout << ">> ERROR: sorting by m" << endl;
+				n_error_sort ++;
+			}
+		}
+		
+		
+		// ADD: FIX NSUBJETTINESS WITH DINKO'S ALGO:
+		double beta = 1.0; // power for angular dependence, e.g. beta = 1 --> linear k-means, beta = 2 --> quadratic/classic k-means
+		double R0 = 1.2; // Characteristic jet radius for normalization	      
+		double Rcut = 1.2; // maximum R particles can be from axis to be included in jet
+		Nsubjettiness nsub1(1, Njettiness::onepass_kt_axes, beta, R0, Rcut);
+		Nsubjettiness nsub2(2, Njettiness::onepass_kt_axes, beta, R0, Rcut);
+		Nsubjettiness nsub3(3, Njettiness::onepass_kt_axes, beta, R0, Rcut);
+		
+		// Clear fatjet variable containers:
+		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){
+			fat_pf[*var].clear();
+		}
+		
+		// Loop over fatjets:
+		int n_fj = -1;
+		for (vector<PseudoJet>::iterator fj = fatjets_pf.begin(); fj != fatjets_pf.end(); ++fj) {
+			n_fj ++;
+			// Declare variables specific to PF fatjet loop:
+		
+			// Apply transformers:
+			PseudoJet fatjet;
+			if (do_prune_) {		// Apply pruning if need be.
+				fatjet = pruner(*fj);
+			}
+			else if (do_trim_){		// Apply trimming if need be.
+				fatjet = trimmer(*fj);
+			}
+			else {
+				fatjet = *fj;
+			}
+			
+			if (n_fj < 2){
+				if (v_) cout << ">> FJ " << n_fj << ": m = " << fatjet.m() << " GeV" << endl;
+			}
+			
+			// Fill the vectors that I want to store as branches.
+			fat_pf["phi"].push_back( fatjet.phi() );
+			fat_pf["y"].push_back( fatjet.rapidity() );
+			fat_pf["pt"].push_back( fatjet.pt() );
+			fat_pf["e"].push_back( fatjet.e() );
+			fat_pf["m"].push_back( fatjet.m() );
+			fat_pf["tau1"].push_back( nsub1(fatjet) );
+			fat_pf["tau2"].push_back( nsub2(fatjet) );
+			fat_pf["tau3"].push_back( nsub3(fatjet) );
+		}
+		
+		// Make branches from the fatjet variable vectors:
+		for (vector<string>::iterator var = fat_vars.begin(); var != fat_vars.end(); ++ var){
+			branches[*var] = trees["fat_pf"]->Branch(var->c_str(), &(fat_pf[*var]), 64000, 0);
+		}
+		trees["fat_pf"]->Fill();		// Save branches to the tree.
 
-	    double beta = 1.0; // power for angular dependence, e.g. beta = 1 --> linear k-means, beta = 2 --> quadratic/classic k-means
-	    double R0 = 1.2; // Characteristic jet radius for normalization	      
-	    double Rcut = 1.2; // maximum R particles can be from axis to be included in jet
-	    Nsubjettiness nsub1(1, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub2(2, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub3(3, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub4(4, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub5(5, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-	    Nsubjettiness nsub6(6, Njettiness::onepass_kt_axes, beta, R0, Rcut);
-		
-		vec_nsub1.clear();
-		vec_nsub2.clear();
-		vec_nsub3.clear();
-		phi.clear();
-		y.clear();
-		pt.clear();
-		e.clear();
-		m.clear();
-		njets = fatjets_pf.size();
-		if (do_prune_ != true) {
-			// Loop over fatjets:
-			for (unsigned i = 0; i < fatjets_pf.size(); i++) {
-				phi.push_back( fatjets_pf[i].phi_std() );		// http://fastjet.fr/repo/doxygen-3.0.2/classfastjet_1_1PseudoJet.html
-				y.push_back( fatjets_pf[i].rapidity() );
-				pt.push_back( fatjets_pf[i].pt() );
-				e.push_back( fatjets_pf[i].e() );
-				m.push_back( fatjets_pf[i].m() );
-				vec_nsub1.push_back( nsub1(fatjets_pf[i]) );
-				vec_nsub2.push_back( nsub2(fatjets_pf[i]) );
-				vec_nsub3.push_back( nsub3(fatjets_pf[i]) );
-			}
-			branches["njets"] = trees["fat"]->Branch("njets", &njets, "njets/I");
-			branches["phi"] = trees["fat"]->Branch("phi", &phi, 64000, 0);
-			branches["y"] = trees["fat"]->Branch("y", &y, 64000, 0);
-			branches["pt"] = trees["fat"]->Branch("pt", &pt, 64000, 0);
-			branches["e"] = trees["fat"]->Branch("e", &e, 64000, 0);
-			branches["m"] = trees["fat"]->Branch("m", &m, 64000, 0);
-			branches["nsub1"] = trees["fat"]->Branch("nsub1", &vec_nsub1, 64000, 0);
-			branches["nsub2"] = trees["fat"]->Branch("nsub2", &vec_nsub2, 64000, 0);
-			branches["nsub3"] = trees["fat"]->Branch("nsub3", &vec_nsub3, 64000, 0);
-			trees["fat"]->Fill();
-		}
-		
-		int n_subjets = 4;		// The number of subjets you want to find.
-		// Loop over reclustering methods:
-		for (unsigned j = 0; j < jet_strings.size(); j++) {
-			string jet_string = jet_strings[j];
-			cout << endl;
-			cout << ">> Performing " << jet_string << " reclustering:" << endl;
-			// Loop over the fatjets:
-			for (unsigned i = 0; i < fatjets_pf.size(); i++) {
-				vector<PseudoJet> jobjects;
-				// Recluster the fatjet, so its cluster sequence is specific to the jet in question.
-//				double e_original = fatjets_pf[i].e();	//debug variable
-				vector<PseudoJet> subjets;
-				if (do_prune_) {
-					Pruner pruner(jet_defs[jet_strings[1]], 1, 0.5);
-					PseudoJet fatjet = pruner(fatjets_pf[i]);
-					jobjects = fatjet.constituents();
-					if (j == 0) {
-						phi.push_back( fatjet.phi_std() );		// http://fastjet.fr/repo/doxygen-3.0.2/classfastjet_1_1PseudoJet.html
-						y.push_back( fatjet.rapidity() );
-						pt.push_back( fatjet.pt() );
-						e.push_back( fatjet.e() );
-						m.push_back( fatjet.m() );
-						vec_nsub1.push_back( nsub1(fatjet) );
-						vec_nsub2.push_back( nsub2(fatjet) );
-						vec_nsub3.push_back( nsub3(fatjet) );
-					}
-				}
-				else {
-					jobjects = fatjets_pf[i].constituents();		// Get all of the original objects that formed into this jet.
-				}
-				ClusterSequence cs_jet(jobjects, jet_defs[jet_strings[j]]);		// Cluster these objects again (back into the same jet).
-				vector<PseudoJet> reclustered_fatjets = sorted_by_pt(cs_jet.inclusive_jets());		// This is saved for debugging; read down a few lines before asking, "what?".
-				if (j == 0 || j == 1) {
-					subjets = sorted_by_pt(cs_jet.exclusive_jets_up_to(n_subjets));		// This basically does what my entire algorithm does...
-				}
-				else if (j == 2){
-					subjets = reclustered_fatjets;
-				}
-				if (reclustered_fatjets.size() != 1 && j != 2) {
-					cout << "WARNING (clustering): Reclustering yielded more than one fatjet." << endl;
-					cout << "WARNING cont: energy of first jet = " << reclustered_fatjets[0].e() << " GeV, e2 = " << reclustered_fatjets[1].e() << " GeV" << endl;
-				}
-				if (i == 0) {
-					pt0_sub.clear();
-					e0_sub.clear();
-					m0_sub.clear();
-					double e_total = 0;
-					for (unsigned k = 0; k < subjets.size(); k++) {
-						pt0_sub.push_back( subjets[k].pt() );
-						e0_sub.push_back( subjets[k].e() );
-						m0_sub.push_back( subjets[k].m() );
-						cout << "    Subjet " << k << ": pt = " << subjets[k].pt() << " GeV,\te = " << subjets[k].e() << " GeV" << endl;
-						e_total += subjets[k].e();
-					}
-	//				cout << "    max_index = " << max_index << "  target = " << target << endl;'
-	//				double e_range;
-					dpt0 = subjets[0].pt() - subjets[subjets.size()-1].pt();
-					cout << "    pt_range = " << dpt0 << endl;
-				}
-				if (i == 1) {
-					pt1_sub.clear();
-					e1_sub.clear();
-					m1_sub.clear();
-					double e_total = 0;
-					for (unsigned k = 0; k < subjets.size(); k++) {
-						pt1_sub.push_back( subjets[k].pt() );
-						e1_sub.push_back( subjets[k].e() );
-						m1_sub.push_back( subjets[k].m() );
-						cout << "    Subjet " << k << ": pt = " << subjets[k].pt() << " GeV,\te = " << subjets[k].e() << " GeV" << endl;
-						e_total += subjets[k].e();
-					}
-	//				cout << "    max_index = " << max_index << "  target = " << target << endl;'
-	//				double e_range;
-					dpt1 = subjets[0].pt() - subjets[subjets.size()-1].pt();
-					cout << "    pt_range = " << dpt1 << endl;
-				}
+//		// OLD SUBJET THINGS
+//		int n_subjets = 4;		// The number of subjets you want to find.
+//		// Loop over reclustering methods:
+//		for (unsigned j = 0; j < jet_strings.size(); j++) {
+//			string jet_string = jet_strings[j];
+//			cout << endl;
+//			cout << ">> Performing " << jet_string << " reclustering:" << endl;
+//			// Loop over the fatjets:
+//			for (unsigned i = 0; i < fatjets_pf.size(); i++) {
+//				vector<PseudoJet> jobjects;
+//				// Recluster the fatjet, so its cluster sequence is specific to the jet in question.
+////				double e_original = fatjets_pf[i].e();	//debug variable
+//				vector<PseudoJet> subjets;
+//				if (do_prune_) {
+//					Pruner pruner(jet_defs[jet_strings[1]], 1, 0.5);
+//					PseudoJet fatjet = pruner(fatjets_pf[i]);
+//					jobjects = fatjet.constituents();
+//					if (j == 0) {
+//						phi.push_back( fatjet.phi_std() );		// http://fastjet.fr/repo/doxygen-3.0.2/classfastjet_1_1PseudoJet.html
+//						y.push_back( fatjet.rapidity() );
+//						pt.push_back( fatjet.pt() );
+//						e.push_back( fatjet.e() );
+//						m.push_back( fatjet.m() );
+//						vec_nsub1.push_back( nsub1(fatjet) );
+//						vec_nsub2.push_back( nsub2(fatjet) );
+//						vec_nsub3.push_back( nsub3(fatjet) );
+//					}
+//				}
+//				else {
+//					jobjects = fatjets_pf[i].constituents();		// Get all of the original objects that formed into this jet.
+//				}
+//				ClusterSequence cs_jet(jobjects, jet_defs[jet_strings[j]]);		// Cluster these objects again (back into the same jet).
+//				vector<PseudoJet> reclustered_fatjets = sorted_by_pt(cs_jet.inclusive_jets());		// This is saved for debugging; read down a few lines before asking, "what?".
+//				if (j == 0 || j == 1) {
+//					subjets = sorted_by_pt(cs_jet.exclusive_jets_up_to(n_subjets));		// This basically does what my entire algorithm does...
+//				}
+//				else if (j == 2){
+//					subjets = reclustered_fatjets;
+//				}
+//				if (reclustered_fatjets.size() != 1 && j != 2) {
+//					cout << "WARNING (clustering): Reclustering yielded more than one fatjet." << endl;
+//					cout << "WARNING cont: energy of first jet = " << reclustered_fatjets[0].e() << " GeV, e2 = " << reclustered_fatjets[1].e() << " GeV" << endl;
+//				}
+//				if (i == 0) {
+//					pt0_sub.clear();
+//					e0_sub.clear();
+//					m0_sub.clear();
+//					double e_total = 0;
+//					for (unsigned k = 0; k < subjets.size(); k++) {
+//						pt0_sub.push_back( subjets[k].pt() );
+//						e0_sub.push_back( subjets[k].e() );
+//						m0_sub.push_back( subjets[k].m() );
+//						cout << "    Subjet " << k << ": pt = " << subjets[k].pt() << " GeV,\te = " << subjets[k].e() << " GeV" << endl;
+//						e_total += subjets[k].e();
+//					}
+//	//				cout << "    max_index = " << max_index << "  target = " << target << endl;'
+//	//				double e_range;
+//					dpt0 = subjets[0].pt() - subjets[subjets.size()-1].pt();
+//					cout << "    pt_range = " << dpt0 << endl;
+//				}
+//				if (i == 1) {
+//					pt1_sub.clear();
+//					e1_sub.clear();
+//					m1_sub.clear();
+//					double e_total = 0;
+//					for (unsigned k = 0; k < subjets.size(); k++) {
+//						pt1_sub.push_back( subjets[k].pt() );
+//						e1_sub.push_back( subjets[k].e() );
+//						m1_sub.push_back( subjets[k].m() );
+//						cout << "    Subjet " << k << ": pt = " << subjets[k].pt() << " GeV,\te = " << subjets[k].e() << " GeV" << endl;
+//						e_total += subjets[k].e();
+//					}
+//	//				cout << "    max_index = " << max_index << "  target = " << target << endl;'
+//	//				double e_range;
+//					dpt1 = subjets[0].pt() - subjets[subjets.size()-1].pt();
+//					cout << "    pt_range = " << dpt1 << endl;
+//				}
 				
 //				// BEGIN SUBJET ALGORITHM (Find the n subjets by unfolding fatjet back n-1 times.)
 //				int max_index = fatjet.cluster_hist_index();
@@ -581,38 +727,44 @@ void Fatjets::analyze(
 //					subjets.push_back(pjets[subjet_indices[j]]);
 //				} 
 //				// END SUBJET ALGORITHM (The subjet indices are stored in subjet_indices and the subjets are stored in subjets.
-			}
-			if (do_prune_) {
-				branches["njets"] = trees["fat"]->Branch("njets", &njets, "njets/I");
-				branches["phi"] = trees["fat"]->Branch("phi", &phi, 64000, 0);
-				branches["y"] = trees["fat"]->Branch("y", &y, 64000, 0);
-				branches["pt"] = trees["fat"]->Branch("pt", &pt, 64000, 0);
-				branches["e"] = trees["fat"]->Branch("e", &e, 64000, 0);
-				branches["m"] = trees["fat"]->Branch("m", &m, 64000, 0);
-				branches["nsub1"] = trees["fat"]->Branch("nsub1", &vec_nsub1, 64000, 0);
-				branches["nsub2"] = trees["fat"]->Branch("nsub2", &vec_nsub2, 64000, 0);
-				branches["nsub3"] = trees["fat"]->Branch("nsub3", &vec_nsub3, 64000, 0);
-				trees["fat"]->Fill();
-			}
-			branches["dpt0"] = trees[jet_string]->Branch("dpt0", &dpt0, "dpt0/D");
-			branches["pt0_sub"] = trees[jet_string]->Branch("pt0_sub", &pt0_sub, 64000, 0);
-			branches["e0_sub"] = trees[jet_string]->Branch("e0_sub", &e0_sub, 64000, 0);
-			branches["m0_sub"] = trees[jet_string]->Branch("m0_sub", &m0_sub, 64000, 0);
-			branches["dpt1"] = trees[jet_string]->Branch("dpt1", &dpt1, "dpt1/D");
-			branches["pt1_sub"] = trees[jet_string]->Branch("pt1_sub", &pt1_sub, 64000, 0);
-			branches["e1_sub"] = trees[jet_string]->Branch("e1_sub", &e1_sub, 64000, 0);
-			branches["m1_sub"] = trees[jet_string]->Branch("m1_sub", &m1_sub, 64000, 0);
-			trees[jet_string]->Fill();
-		}
+//			}
+//			if (do_prune_) {
+//				branches["njets"] = trees["fat"]->Branch("njets", &njets, "njets/I");
+//				branches["phi"] = trees["fat"]->Branch("phi", &phi, 64000, 0);
+//				branches["y"] = trees["fat"]->Branch("y", &y, 64000, 0);
+//				branches["pt"] = trees["fat"]->Branch("pt", &pt, 64000, 0);
+//				branches["e"] = trees["fat"]->Branch("e", &e, 64000, 0);
+//				branches["m"] = trees["fat"]->Branch("m", &m, 64000, 0);
+//				branches["nsub1"] = trees["fat"]->Branch("nsub1", &vec_nsub1, 64000, 0);
+//				branches["nsub2"] = trees["fat"]->Branch("nsub2", &vec_nsub2, 64000, 0);
+//				branches["nsub3"] = trees["fat"]->Branch("nsub3", &vec_nsub3, 64000, 0);
+//				trees["fat"]->Fill();
+//			}
+//			branches["dpt0"] = trees[jet_string]->Branch("dpt0", &dpt0, "dpt0/D");
+//			branches["pt0_sub"] = trees[jet_string]->Branch("pt0_sub", &pt0_sub, 64000, 0);
+//			branches["e0_sub"] = trees[jet_string]->Branch("e0_sub", &e0_sub, 64000, 0);
+//			branches["m0_sub"] = trees[jet_string]->Branch("m0_sub", &m0_sub, 64000, 0);
+//			branches["dpt1"] = trees[jet_string]->Branch("dpt1", &dpt1, "dpt1/D");
+//			branches["pt1_sub"] = trees[jet_string]->Branch("pt1_sub", &pt1_sub, 64000, 0);
+//			branches["e1_sub"] = trees[jet_string]->Branch("e1_sub", &e1_sub, 64000, 0);
+//			branches["m1_sub"] = trees[jet_string]->Branch("m1_sub", &m1_sub, 64000, 0);
+//			trees[jet_string]->Fill();
+//		}
 	}
 }
 
 // ------------  called once each job just after ending the event loop  ------------
 void Fatjets::endJob()
 {
-	cout << counter << endl;
-	cout << n_error_g << endl;
-	cout << n_error_m << endl;
+	cout << "Error records for gen clustering:" << endl;
+//	cout << n_error_g << endl;
+	cout << "* Squark number errors: " << n_error_sq << endl;
+	cout << "* Sorting errors: " << n_error_sort << endl;
+//	cout << outliers.size() << endl;
+//	for (auto o : outliers) {
+//		cout << o << "  ";
+//	}
+//	cout << endl;
 }
 
 // ------------ method called when starting to processes a run  ------------
